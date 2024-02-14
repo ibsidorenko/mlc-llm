@@ -39,6 +39,7 @@ from tvm import relax
 from tvm.contrib.nvcc import parse_compute_version
 from tvm.relax.backend import get_patterns_with_prefix
 from tvm.relax.backend.contrib.cutlass import annotate_workspace
+from mlc_llm.quantization.smoothquant_utils import smoothquant, dataset_list, get_single_batch_model
 
 
 @dataclass
@@ -407,6 +408,17 @@ class BuildArgs:
         default="vllm",
         metadata={"help": "The type of paged KV cache, either vllm or flash-decoding"},
     )
+    dataset: str = field(
+        default="dummy",
+        metadata={
+            "help": "Name of dataset for calibration.",
+            "choices": dataset_list,
+        },
+    )
+    calibrate_target: str = field(
+        default=None,
+        metadata={"help": "The target platform for calibration process"},
+    )
 
     @property
     def convert_weight_only(self):
@@ -580,38 +592,10 @@ def mod_transform_before_build(
     config: Dict,
 ) -> tvm.IRModule:
     """First-stage: Legalize ops and trace"""
-    if args.model.startswith("minigpt"):
-        model_names = ["embed"]
-    else:
-        model_names = [
-            "prefill",
-            "decode",
-        ]
-
-        if not args.use_vllm_attention:
-            model_names += [
-                "create_kv_cache",
-                "softmax_with_temperature",
-                "get_metadata",
-            ]
-        else:
-            # This is equivalent to prefill but without KV cache. It is used for
-            # determining the number of paged cache blocks that can be allocated.
-            model_names.append("evaluate")
-            model_names.append("evaluate_multi_query")
-
-            if args.paged_kv_cache_type == "flash-decoding":
-                model_names.append("decode_multi_query")
-
-        if args.sep_embed:
-            model_names = ["embed", "prefill_with_embed"] + model_names[1:]
-            if args.enable_batching:
-                model_names[2] = "decode_with_embed"
-        if args.model.lower().startswith("rwkv-"):
-            model_names += ["reset_kv_cache"]
-
-    mod = param_manager.transform_dequantize()(mod)
-    mod = relax.transform.BundleModelParams()(mod)
+    model_names = utils.get_model_names(args)
+    if not args.quantization.name.startswith("smq_q8i8"):
+        mod = param_manager.transform_dequantize()(mod)
+        mod = relax.transform.BundleModelParams()(mod)
 
     use_ft_quant = args.quantization.name in [
         "q4f16_ft",
@@ -665,7 +649,12 @@ def mod_transform_before_build(
 
         has_cublas = tvm.get_global_func("relax.ext.cublas", True)
 
-        if has_cublas and args.quantization.name in ("q0f16", "q0f32") and not args.no_cublas:
+        qname = args.quantization.name
+        if (
+            has_cublas
+            and (qname in ("q0f16", "q0f32")  or qname.startswith("smq_q8i8"))
+            and not args.no_cublas
+        ):
             patterns += get_patterns_with_prefix("cublas")
 
         if len(patterns) > 0:
@@ -824,7 +813,8 @@ def build(mod_deploy: tvm.IRModule, args: argparse.Namespace) -> None:
             mod_deploy["decode"] = mod_deploy["decode"].with_attr({"num_input": 3})
         ex = relax.build(mod_deploy, args.target, system_lib=args.system_lib)
 
-    utils.debug_dump_shader(ex, f"{args.model}_{args.quantization.name}_{target_kind}", args)
+    if target_kind != "cpu":
+        utils.debug_dump_shader(ex, f"{args.model}_{args.quantization.name}_{target_kind}", args)
     ex.export_library(args.lib_path, **args.export_kwargs)
     print(f"Finish exporting to {args.lib_path}")
 
@@ -902,7 +892,38 @@ def build_model_from_args(args: argparse.Namespace):
             qspec_updater = qspec_updater_class(param_manager)
             qspec_updater.visit_module(mod)
 
+        if args.model_category != "minigpt":
+            utils.copy_tokenizer(args)
+
         if not args.build_model_only:
+            if not args.enable_batching:
+                if args.model_category == "rwkv" or args.model_category == "rwkv_world":
+                    # TODO: refactor config into model definition
+                    dump_mlc_chat_config(
+                        args,
+                        vocab_size=config["vocab_size"],
+                        max_window_size=model_config.max_sequence_length,
+                        max_gen_len=model_config.max_sequence_length,
+                        top_p=0.6,
+                        temperature=1.2,
+                        repetition_penalty=0.996,
+                        rwkv_world=True,
+                    )
+                elif args.model_category == "chatglm":
+                    dump_mlc_chat_config(
+                        args,
+                        vocab_size=config["padded_vocab_size"],
+                        max_window_size=model_config.max_sequence_length,
+                        max_gen_len=model_config.max_sequence_length,
+                    )
+                else:
+                    dump_mlc_chat_config(
+                        args,
+                        vocab_size=config["vocab_size"],
+                        max_window_size=model_config.max_sequence_length,
+                        max_gen_len=model_config.max_sequence_length,
+                    )
+
             parameter_transforms = []
 
             # Run pre-quantization if provided.
@@ -956,35 +977,26 @@ def build_model_from_args(args: argparse.Namespace):
 
                 params = preprocessed
 
+            if args.quantization.name.startswith("smq_q8i8"):
+                model_names = utils.get_model_names(args)
+                if args.enable_batching:
+                    sb_mod, sb_model_names = get_single_batch_model(args, model_generators, config)
+                else:
+                    sb_mod, sb_model_names = (mod, model_names)
+
+                mod, params = smoothquant(
+                        args,
+                        enable_batching=args.enable_batching,
+                        mod=mod,
+                        model_names=model_names,
+                        calibrate_mod=sb_mod,
+                        calibrate_model_names=sb_model_names,
+                        cpu_params=params
+                    )
+                utils.debug_dump_script(mod, "mod_smoothquant.py", args)
+
             utils.save_params(params, args.artifact_path, args.num_shards if args.use_presharded_weights else 1)
 
-            if not args.enable_batching:
-                if args.model_category == "rwkv" or args.model_category == "rwkv_world":
-                    # TODO: refactor config into model definition
-                    dump_mlc_chat_config(
-                        args,
-                        vocab_size=config["vocab_size"],
-                        max_window_size=model_config.max_sequence_length,
-                        max_gen_len=model_config.max_sequence_length,
-                        top_p=0.6,
-                        temperature=1.2,
-                        repetition_penalty=0.996,
-                        rwkv_world=True,
-                    )
-                elif args.model_category == "chatglm":
-                    dump_mlc_chat_config(
-                        args,
-                        vocab_size=config["padded_vocab_size"],
-                        max_window_size=model_config.max_sequence_length,
-                        max_gen_len=model_config.max_sequence_length,
-                    )
-                else:
-                    dump_mlc_chat_config(
-                        args,
-                        vocab_size=config["vocab_size"],
-                        max_window_size=model_config.max_sequence_length,
-                        max_gen_len=model_config.max_sequence_length,
-                    )
 
         if args.enable_batching:
             # when batching is enabled, we dump info for mlc_serve runtime
@@ -1014,9 +1026,6 @@ def build_model_from_args(args: argparse.Namespace):
 
             with open(mlc_model_config_path, "w", encoding="utf-8") as outfile:
                 json.dump(mlc_model_config, outfile, indent=4)
-
-        if args.model_category != "minigpt":
-            utils.copy_tokenizer(args)
 
         if args.convert_weights_only:
             exit(0)

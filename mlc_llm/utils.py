@@ -5,7 +5,7 @@ import json
 import math
 import os
 import shutil
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import tvm
@@ -29,6 +29,39 @@ supported_model_types = set(
         "stablelm_epoch",
     ]
 )
+
+
+def get_model_names(args: argparse.Namespace):
+    if args.model.startswith("minigpt"):
+        model_names = ["embed"]
+    else:
+        model_names = [
+            "prefill",
+            "decode",
+        ]
+
+        if not args.use_vllm_attention:
+            model_names += [
+                "create_kv_cache",
+                "softmax_with_temperature",
+                "get_metadata",
+            ]
+        else:
+            # This is equivalent to prefill but without KV cache. It is used for
+            # determining the number of paged cache blocks that can be allocated.
+            model_names.append("evaluate")
+            model_names.append("evaluate_multi_query")
+
+            if args.paged_kv_cache_type == "flash-decoding":
+                model_names.append("decode_multi_query")
+
+        if args.sep_embed:
+            model_names = ["embed", "prefill_with_embed"] + model_names[1:]
+            if args.enable_batching:
+                model_names[2] = "decode_with_embed"
+        if args.model.lower().startswith("rwkv-"):
+            model_names += ["reset_kv_cache"]
+    return model_names
 
 
 def wrap_tqdm_counter(func, **tqdm_kwargs):
@@ -144,7 +177,7 @@ def argparse_postproc_common(args: argparse.Namespace) -> None:
         args.quantization.final_fc_weight.do_preprocess = False
 
 
-def debug_dump_script(mod, name, args: argparse.Namespace, show_meta=True):
+def debug_dump_script(mod, name, args: argparse.Namespace, show_meta=False):
     """Debug dump mode"""
     if not args.debug_dump:
         return
@@ -336,7 +369,34 @@ def load_params(artifact_path: str, device) -> List[tvm.nd.NDArray]:
     return plist
 
 
+def split_transform_deploy_mod(
+    mod: tvm.IRModule, model_names: List[str]
+) -> Tuple[tvm.IRModule, tvm.IRModule]:
+    mod_transform = tvm.IRModule()
+    mod_deploy = tvm.IRModule()
+    transform_func_name = "transform_params"
+    transform_func_names=[]
+
+    for gv in mod.functions:
+        func = mod[gv]
+        if isinstance(func, tvm.tir.PrimFunc):
+            mod_transform[gv] = func
+            mod_deploy[gv] = func
+        elif transform_func_name in gv.name_hint:
+            mod_transform[gv] = func
+            transform_func_names.append(gv.name_hint)
+        else:
+            mod_deploy[gv] = func
+
+    mod_transform = relax.transform.DeadCodeElimination(transform_func_names)(mod_transform)
+    mod_deploy = relax.transform.DeadCodeElimination(model_names)(mod_deploy)
+    return mod_transform, mod_deploy
+
+
 def copy_tokenizer(args: argparse.Namespace) -> None:
+    params_dir = os.path.join(args.artifact_path, "model") if args.enable_batching else os.path.join(args.artifact_path, "params")
+    if not os.path.exists(params_dir):
+        os.makedirs(params_dir)
     for filename in os.listdir(args.model_path):
         if filename in [
             "tokenizer.model",
@@ -346,10 +406,7 @@ def copy_tokenizer(args: argparse.Namespace) -> None:
             "added_tokens.json",
             "tokenizer_config.json",
         ]:
-            shutil.copy(
-                os.path.join(args.model_path, filename),
-                os.path.join(args.artifact_path, "model") if args.enable_batching else os.path.join(args.artifact_path, "params"),
-            )
+            shutil.copy(os.path.join(args.model_path, filename), params_dir)
 
     # If we have `tokenizer.model` but not `tokenizer.json`, try convert it to
     # `tokenizer.json` with `transformers`.
